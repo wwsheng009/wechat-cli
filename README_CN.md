@@ -93,6 +93,9 @@ wechat-cli init
 
 这一步会自动检测微信数据目录、提取加密密钥，并保存到 `~/.wechat-cli/`。
 
+> Windows 的在线提取、版本检测、无需 Hook/重启微信的细节见
+> [docs/KEY-EXTRACTION.md](docs/KEY-EXTRACTION.md)。
+
 ![init-claude-code-1](image/init-claude-code-1.png)
 
 如果是 mac，需要执行 sudo 命令，然后需要输入密码：

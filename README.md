@@ -95,6 +95,9 @@ wechat-cli init
 
 This auto-detects your WeChat data directory, extracts encryption keys, and saves config to `~/.wechat-cli/`.
 
+> For the Windows online extractor (version detection, no hook, no WeChat restart),
+> see [docs/KEY-EXTRACTION.md](docs/KEY-EXTRACTION.md).
+
 ![init-claude-code-1](image/init-claude-code-1.png)
 
 On macOS, you'll need to run the `sudo` command and enter your password:
