@@ -17,7 +17,11 @@ SALT_SZ = 16
 
 
 def verify_enc_key(enc_key, db_page1):
-    """通过 HMAC-SHA512 校验 page 1 验证 enc_key 是否正确。"""
+    """通过 HMAC-SHA512 校验 page 1 验证 enc_key 是否正确。
+
+    ``enc_key`` 必须是已经过 256,000 轮 PBKDF2 的 32 字节页密钥；
+    如果手里是 32 字节裸 key，先用 :func:`verify_raw_key`。
+    """
     salt = db_page1[:SALT_SZ]
     mac_salt = bytes(b ^ 0x3A for b in salt)
     mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
@@ -26,6 +30,17 @@ def verify_enc_key(enc_key, db_page1):
     hm = hmac_mod.new(mac_key, hmac_data, hashlib.sha512)
     hm.update(struct.pack("<I", 1))
     return hm.digest() == stored_hmac
+
+
+def derive_enc_key(raw_key, salt):
+    """SQLCipher 4: PBKDF2-HMAC-SHA512(raw_key, salt, 256000, 32)."""
+    return hashlib.pbkdf2_hmac("sha512", raw_key, salt, 256_000, dklen=KEY_SZ)
+
+
+def verify_raw_key(raw_key, db_page1):
+    """校验 32 字节裸 key（captured key / hook key）是否匹配 page 1。"""
+    salt = db_page1[:SALT_SZ]
+    return verify_enc_key(derive_enc_key(raw_key, salt), db_page1)
 
 
 def collect_db_files(db_dir):
@@ -42,12 +57,16 @@ def collect_db_files(db_dir):
             if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
                 continue
             path = os.path.join(root, name)
+            rel = os.path.relpath(path, db_dir)
+            # WCDB migration/factory copies are not live databases and can
+            # carry a different salt/key; they would show up as false MISSING.
+            if ".db.factory" in rel.replace("\\", "/"):
+                continue
             size = os.path.getsize(path)
             if size < PAGE_SZ:
                 continue
             with open(path, "rb") as f:
                 page1 = f.read(PAGE_SZ)
-            rel = os.path.relpath(path, db_dir)
             salt = page1[:SALT_SZ].hex()
             db_files.append((rel, path, size, salt, page1))
             salt_to_dbs.setdefault(salt, []).append(rel)
@@ -78,7 +97,7 @@ def scan_memory_for_keys(data, hex_re, db_files, salt_to_dbs, key_map,
                         remaining_salts.discard(salt_hex)
                         dbs = salt_to_dbs[salt_hex]
                         print_fn(f"\n  [FOUND] salt={salt_hex}")
-                        print_fn(f"    enc_key={enc_key_hex}")
+                        print_fn("    enc_key=<redacted>")
                         print_fn(f"    PID={pid} 地址: 0x{addr:016X}")
                         print_fn(f"    数据库: {', '.join(dbs)}")
                         break
@@ -94,7 +113,7 @@ def scan_memory_for_keys(data, hex_re, db_files, salt_to_dbs, key_map,
                     remaining_salts.discard(salt_hex_db)
                     dbs = salt_to_dbs[salt_hex_db]
                     print_fn(f"\n  [FOUND] salt={salt_hex_db}")
-                    print_fn(f"    enc_key={enc_key_hex}")
+                    print_fn("    enc_key=<redacted>")
                     print_fn(f"    PID={pid} 地址: 0x{addr:016X}")
                     print_fn(f"    数据库: {', '.join(dbs)}")
                     break
@@ -110,7 +129,7 @@ def scan_memory_for_keys(data, hex_re, db_files, salt_to_dbs, key_map,
                         remaining_salts.discard(salt_hex)
                         dbs = salt_to_dbs[salt_hex]
                         print_fn(f"\n  [FOUND] salt={salt_hex} (long hex {hex_len})")
-                        print_fn(f"    enc_key={enc_key_hex}")
+                        print_fn("    enc_key=<redacted>")
                         print_fn(f"    PID={pid} 地址: 0x{addr:016X}")
                         print_fn(f"    数据库: {', '.join(dbs)}")
                         break

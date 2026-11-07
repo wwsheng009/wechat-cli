@@ -12,7 +12,14 @@ from ..core.config import STATE_DIR, CONFIG_FILE, KEYS_FILE, auto_detect_db_dir
 @click.command()
 @click.option("--db-dir", default=None, help="微信数据目录路径（默认自动检测）")
 @click.option("--force", is_flag=True, help="强制重新提取密钥")
-def init(db_dir, force):
+@click.option(
+    "--mode",
+    type=click.Choice(["auto", "hex", "raw"]),
+    default="auto",
+    show_default=True,
+    help="Windows 密钥后端：auto=先 hex 再裸 key；hex=仅旧格式；raw=仅裸 32 字节",
+)
+def init(db_dir, force, mode):
     """初始化 wechat-cli：提取密钥并生成配置"""
     click.echo("WeChat CLI 初始化")
     click.echo("=" * 40)
@@ -46,7 +53,10 @@ def init(db_dir, force):
     click.echo("\n开始提取密钥...")
     try:
         from ..keys import extract_keys
-        key_map = extract_keys(db_dir, KEYS_FILE)
+        if sys.platform == "win32":
+            key_map = extract_keys(db_dir, KEYS_FILE, mode=mode)
+        else:
+            key_map = extract_keys(db_dir, KEYS_FILE)
     except RuntimeError as e:
         click.echo(f"\n[!] 密钥提取失败: {e}", err=True)
         if "sudo" not in str(e).lower():
