@@ -39,6 +39,25 @@ RAW_MARKERS = (b"encrypt_key:32", b"encrypted:1")
 ZERO16 = b"\x00" * 16
 ZERO32 = b"\x00" * 32
 
+# 已验证的 raw 布局。微信升级后先在这里加版本；未列出的版本会告警并尝试，
+# 扫描失败时错误信息会带上版本号，提示升级算法。
+VERIFIED_RAW_VERSIONS = {
+    (4, 1, 15, 56): "lfh-0x40",
+    (4, 2, 0, 13): "lfh-0x40",
+}
+RAW_FLOOR = (4, 1, 15)
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+class VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSignature", wt.DWORD),
+        ("dwStrucVersion", wt.DWORD),
+        ("dwFileVersionMS", wt.DWORD),
+        ("dwFileVersionLS", wt.DWORD),
+    ]
+
 
 class MBI(ctypes.Structure):
     _fields_ = [
@@ -71,6 +90,80 @@ def _get_pids():
     for pid, mem in pids:
         print(f"[+] Weixin.exe PID={pid} ({mem // 1024}MB)")
     return pids
+
+
+def _get_process_path(pid):
+    """QueryFullProcessImageNameW; needs QUERY_LIMITED_INFORMATION."""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wt.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return buf.value or None
+        return None
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def _file_version(path):
+    """Read the fixed file version (major, minor, build, revision)."""
+    if not path or not os.path.isfile(path):
+        return None
+    version = ctypes.windll.version
+    handle = wt.DWORD(0)
+    size = version.GetFileVersionInfoSizeW(str(path), ctypes.byref(handle))
+    if not size:
+        return None
+    buf = ctypes.create_string_buffer(size)
+    if not version.GetFileVersionInfoW(str(path), 0, size, buf):
+        return None
+    ptr = ctypes.c_void_p()
+    length = wt.UINT(0)
+    if not version.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)):
+        return None
+    if not ptr.value or length.value < ctypes.sizeof(VS_FIXEDFILEINFO):
+        return None
+    info = ctypes.cast(ptr, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+    ms, ls = info.dwFileVersionMS, info.dwFileVersionLS
+    return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF)
+
+
+def _version_text(version):
+    return ".".join(str(part) for part in version) if version else "unknown"
+
+
+def _detect_wechat_version(pids):
+    """Return (version_tuple, exe_path) for the running WeChat process."""
+    seen = set()
+    for pid, _mem_kb in pids:
+        exe = _get_process_path(pid)
+        if not exe or exe.lower() in seen:
+            continue
+        seen.add(exe.lower())
+        candidates = [exe]
+        install_dir = os.path.dirname(exe)
+        for name in ("Weixin.dll", "WeChat.dll"):
+            candidate = os.path.join(install_dir, name)
+            if os.path.isfile(candidate):
+                candidates.append(candidate)
+        versions = [v for v in (_file_version(p) for p in candidates) if v]
+        if versions:
+            return max(versions), exe
+    return None, None
+
+
+def _backend_order(version, mode):
+    """Choose backend order; explicit mode is honored verbatim."""
+    if mode in ("hex", "raw"):
+        return [mode]
+    if version is None:
+        print("[!] 未能读取微信版本，按 hex -> raw 顺序尝试")
+        return ["hex", "raw"]
+    if version >= RAW_FLOOR:
+        return ["raw", "hex"]
+    return ["hex", "raw"]
 
 
 def _read_mem(h, addr, sz):
@@ -286,7 +379,7 @@ def extract_keys(db_dir, output_path, pid=None, mode="auto", workers=None):
         db_dir: 微信数据库目录
         output_path: all_keys.json 输出路径
         pid: 可选，指定 PID（默认自动检测所有 Weixin.exe）
-        mode: ``auto``（先 hex 再 raw）、``hex``、``raw``
+        mode: ``auto``（按版本选 raw/hex 顺序）、``hex``、``raw``
         workers: raw 校验线程数（默认 min(16, CPU 数)）
 
     Returns:
@@ -307,26 +400,45 @@ def extract_keys(db_dir, output_path, pid=None, mode="auto", workers=None):
         print(f"  salt {salt_hex}: {', '.join(dbs)}")
 
     pids = _get_pids() if pid is None else [(pid, 0)]
-    hex_matches = 0
-
-    if mode in ("auto", "hex"):
-        key_map, hex_matches = _scan_hex(db_files, salt_to_dbs, pids)
-        if key_map:
-            cross_verify_keys(db_files, salt_to_dbs, key_map, print)
-            return save_results(db_files, salt_to_dbs, key_map, output_path, print)
-        if mode == "hex":
-            raise RuntimeError(
-                f"未找到 x'<hex>' 形式的密钥（hex 模式匹配 {hex_matches} 个）；"
-                "当前微信版本可能改存裸 32 字节 key，请使用 mode='raw' 或 'auto'"
+    version, exe_path = _detect_wechat_version(pids)
+    profile = VERIFIED_RAW_VERSIONS.get(version)
+    if version:
+        if profile:
+            print(f"[+] 微信版本: {_version_text(version)} (profile={profile}, 已验证)")
+        else:
+            print(
+                f"[!] 微信版本: {_version_text(version)} 未验证；"
+                "当前算法仅验证过 4.1.15.56 / 4.2.0.13，仍会尝试，失败时需要升级算法"
             )
-        print("\n[!] hex 后端没有匹配到 key，切换到 raw 内存扫描")
+    else:
+        print("[!] 未能读取微信版本；仍会尝试，失败时需要检查权限或升级算法")
+    if exe_path:
+        print(f"[+] Weixin.exe: {exe_path}")
 
-    key_map = _scan_raw(db_files, pids, workers=workers)
-    if key_map:
-        return save_results(db_files, salt_to_dbs, key_map, output_path, print)
+    hex_matches = 0
+    key_map = {}
+    for backend in _backend_order(version, mode):
+        if backend == "hex":
+            key_map, hex_matches = _scan_hex(db_files, salt_to_dbs, pids)
+            if key_map:
+                cross_verify_keys(db_files, salt_to_dbs, key_map, print)
+                return save_results(db_files, salt_to_dbs, key_map, output_path, print)
+            print("\n[!] hex 后端没有匹配到 key")
+        elif backend == "raw":
+            key_map = _scan_raw(db_files, pids, workers=workers)
+            if key_map:
+                return save_results(db_files, salt_to_dbs, key_map, output_path, print)
+            print("\n[!] raw 后端没有匹配到 key")
 
+    version_note = _version_text(version) if version else "unknown"
+    if profile:
+        raise RuntimeError(
+            f"微信版本 {version_note} 已验证，但仍未提取到密钥；"
+            f"hex 模式匹配 {hex_matches} 个，raw 候选校验未命中。"
+            "请确认微信已登录、db_dir 属于该账号，并以管理员权限运行。"
+        )
     raise RuntimeError(
-        "未能从当前 Weixin.exe 内存中提取到密钥；"
+        f"未能从微信版本 {version_note} 的内存中提取到密钥；"
         f"hex 模式匹配 {hex_matches} 个，raw 候选校验未命中。"
-        "请确认微信已登录、db_dir 属于该账号，并以管理员权限运行。"
+        "该版本尚未验证：请保留版本号和失败日志，升级内存布局算法后再试。"
     )

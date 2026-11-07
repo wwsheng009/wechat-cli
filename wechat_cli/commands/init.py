@@ -17,7 +17,7 @@ from ..core.config import STATE_DIR, CONFIG_FILE, KEYS_FILE, auto_detect_db_dir
     type=click.Choice(["auto", "hex", "raw"]),
     default="auto",
     show_default=True,
-    help="Windows 密钥后端：auto=先 hex 再裸 key；hex=仅旧格式；raw=仅裸 32 字节",
+    help="Windows 密钥后端：auto=按微信版本选择；hex=仅旧格式；raw=仅裸 32 字节",
 )
 def init(db_dir, force, mode):
     """初始化 wechat-cli：提取密钥并生成配置"""
